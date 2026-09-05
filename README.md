@@ -68,6 +68,18 @@ pixi run inference
 Downloaded model weights remain outside version control under `pretrained/`.
 They can be fetched with `pixi run download-models` when needed.
 
+With both the Wan backbone and released RynnWorld-4D weights in place, run one
+BF16 training step on a single 32 GB GPU with ZeRO-3 CPU offload:
+
+```bash
+pixi run train-pretrained-smoke
+```
+
+The smoke task trains only the joint-attention parameters, writes TensorBoard
+events under `outputs/pretrained-stage3-smoke-1step/`, and intentionally skips
+the large final checkpoint. Override the output directory with
+`RYNNWORLD_SMOKE_OUTPUT_DIR` if needed.
+
 #### Conda / pip
 
 We use anaconda or miniconda to manage the python environment:

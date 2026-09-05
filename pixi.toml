@@ -18,9 +18,12 @@ bash -c '\
 """
 # CPU-safe environment check. Reading package metadata does not import PyTorch
 # or initialize CUDA.
-verify = "python -c \"from importlib.metadata import version; names = ('torch', 'accelerate', 'deepspeed', 'diffusers', 'transformers'); print('\\n'.join(f'{name}={version(name)}' for name in names))\""
+verify = "python -c \"from importlib.metadata import version; names = ('torch', 'accelerate', 'deepspeed', 'diffusers', 'transformers', 'tensorboard'); print('\\n'.join(f'{name}={version(name)}' for name in names))\""
 # Run only when the GPU is available for this process.
 verify-gpu = "python -c \"import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print(f'cuda={torch.version.cuda}'); print(f'gpu={torch.cuda.get_device_name(0)}')\""
+# One non-zero-LR optimizer step from the released stage-3 checkpoint. This
+# targets a single 32 GB GPU by offloading parameters and optimizer state.
+train-pretrained-smoke = "bash scripts/train_pretrained_smoke.sh"
 # World-model inference with the released stage-3 checkpoint.
 inference = """
 python inference-sft.py \
@@ -53,6 +56,7 @@ peft = "==0.18.0"
 ftfy = "==6.3.1"
 numpy = "==1.26.4"
 wandb = "==0.23.0"
+tensorboard = "==2.21.0"
 decord = "==0.6.0"
 deepspeed = "==0.18.2"
 opencv-python-headless = "*"

@@ -130,12 +130,23 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
         cprint(f"Loading components from: {model_path}",'green')
         components.pipeline_cls = WanImageToVideoPipeline
-        components.tokenizer = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer")
-        components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
-        components.scheduler = UniPCMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
-
         ds_plugin = self.accelerator.state.deepspeed_plugin
         is_zero3 = ds_plugin is not None and ds_plugin.zero_stage == 3
+
+        if is_zero3:
+            # Accelerator registers a Transformers-global ZeRO-3 hook. T5 and
+            # the VAE are preprocessing-only components and are never wrapped
+            # by the DeepSpeed engine, so partitioning them leaves unusable
+            # zero-sized parameters. The transformer is partitioned explicitly
+            # below and does not depend on this global hook.
+            from transformers.integrations.deepspeed import unset_hf_deepspeed_config
+
+            unset_hf_deepspeed_config()
+
+        components.tokenizer = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer")
+        components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
+        components.vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
+        components.scheduler = UniPCMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
 
         # Select model class based on fusion_mode
         if self.args.fusion_mode == "joint":
@@ -155,13 +166,38 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
         if is_zero3:
             import deepspeed
+            full_checkpoint = None
+            requested_checkpoint = getattr(self.args, "load_stage2_model_weights", None)
+            if requested_checkpoint:
+                candidate = os.path.join(
+                    requested_checkpoint,
+                    "pytorch_model",
+                    "mp_rank_00_model_states.pt",
+                )
+                if os.path.isfile(candidate):
+                    full_checkpoint = candidate
+
             with deepspeed.zero.Init(config_dict_or_path=ds_plugin.deepspeed_config):
-                components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
-                components.vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
-                components.high_noise_model = model_cls.from_pretrained(model_path, **model_kwargs)
+                # Diffusers builds VAE/T5 weights through meta tensors when loading.
+                # DeepSpeed zero.Init cannot partition those meta tensors, and neither
+                # component participates in the training forward pass. Keep them out
+                # of zero.Init and use the context only for the 15.9B transformer.
+                if full_checkpoint is not None:
+                    # A complete RynnWorld checkpoint will replace every transformer
+                    # parameter later. Construct the exact tri-branch architecture
+                    # directly from config, avoiding Diffusers' nested meta-tensor
+                    # loader and an unnecessary 5B base-weight materialization.
+                    base_config = dict(
+                        WanTransformer3DModel.load_config(
+                            model_path,
+                            subfolder="transformer",
+                        )
+                    )
+                    base_config.update({k: v for k, v in model_kwargs.items() if k != "subfolder"})
+                    components.high_noise_model = model_cls.from_config(base_config)
+                else:
+                    components.high_noise_model = model_cls.from_pretrained(model_path, **model_kwargs)
         else:
-            components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
-            components.vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
             components.high_noise_model = model_cls.from_pretrained(model_path, **model_kwargs)
 
         boundary_ratio = 0
@@ -504,32 +540,81 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             unwrapped_model = self.accelerator.unwrap_model(self.components.high_noise_model)
             sft_model_path = os.path.join(stage2_dir, "pytorch_model", "mp_rank_00_model_states.pt")
             if os.path.exists(sft_model_path):
-                stage2_sd = torch.load(sft_model_path, map_location="cpu")
+                stage2_sd = torch.load(
+                    sft_model_path,
+                    map_location="cpu",
+                    mmap=True,
+                    weights_only=False,
+                )
                 if "module" in stage2_sd:
                     stage2_sd = stage2_sd["module"]
 
-                model_sd = unwrapped_model.state_dict()
-                matched = 0
-                skipped = 0
+                parameter_shapes = {
+                    name: tuple(getattr(param, "ds_shape", param.shape))
+                    for name, param in unwrapped_model.named_parameters()
+                }
+                buffer_shapes = {
+                    name: tuple(buffer.shape)
+                    for name, buffer in unwrapped_model.named_buffers()
+                }
+                expected_shapes = {**parameter_shapes, **buffer_shapes}
+                cleaned_state_dict = {}
+                skipped = []
                 for k, v in stage2_sd.items():
                     clean_k = k.replace("module.", "")
-                    if clean_k in model_sd:
-                        if model_sd[clean_k].shape == v.shape:
-                            model_sd[clean_k] = v.to(model_sd[clean_k].device)
-                            matched += 1
-                        else:
-                            skipped += 1
-                    elif k in model_sd:
-                        if model_sd[k].shape == v.shape:
-                            model_sd[k] = v.to(model_sd[k].device)
-                            matched += 1
-                        else:
-                            skipped += 1
+                    target_key = clean_k if clean_k in expected_shapes else k
+                    if target_key in expected_shapes and tuple(v.shape) == expected_shapes[target_key]:
+                        cleaned_state_dict[target_key] = v
+                    else:
+                        skipped.append(k)
 
-                unwrapped_model.load_state_dict(model_sd, strict=False)
+                missing_parameters = sorted(set(parameter_shapes) - set(cleaned_state_dict))
+                if missing_parameters:
+                    raise RuntimeError(
+                        "Full RynnWorld checkpoint is missing model parameters; "
+                        f"first missing keys: {missing_parameters[:5]}"
+                    )
+
+                is_zero3 = (
+                    self.accelerator.state.deepspeed_plugin is not None
+                    and self.accelerator.state.deepspeed_plugin.zero_stage == 3
+                )
+                if is_zero3:
+                    load_errors = []
+
+                    def load_zero3_module(module, prefix=""):
+                        direct_parameters = list(module.parameters(recurse=False))
+                        with deepspeed.zero.GatheredParameters(direct_parameters, modifier_rank=0):
+                            if self.accelerator.is_main_process:
+                                module._load_from_state_dict(
+                                    cleaned_state_dict,
+                                    prefix,
+                                    {},
+                                    False,
+                                    [],
+                                    [],
+                                    load_errors,
+                                )
+                        for child_name, child in module._modules.items():
+                            if child is not None:
+                                load_zero3_module(child, prefix + child_name + ".")
+
+                    load_zero3_module(unwrapped_model)
+                    if load_errors:
+                        raise RuntimeError(
+                            "Failed to load the full RynnWorld checkpoint under ZeRO-3: "
+                            + "; ".join(load_errors[:5])
+                        )
+                else:
+                    unwrapped_model.load_state_dict(cleaned_state_dict, strict=False)
+
+                matched = len(cleaned_state_dict)
                 cprint(f"  Loaded {matched} stage2 model weights (model only, fresh optimizer).", "green")
-                if skipped > 0:
-                    cprint(f"  Skipped {skipped} keys (shape mismatch).", "yellow")
+                if skipped:
+                    cprint(f"  Skipped {len(skipped)} non-model or shape-mismatched keys.", "yellow")
+                del cleaned_state_dict, stage2_sd
+                import gc
+                gc.collect()
             else:
                 cprint(f"  Warning: model states not found at {sft_model_path}", "red")
 
@@ -546,12 +631,43 @@ class RynnWorld4DTrainer(WanI2VTrainer):
         self.move_components_to_device(dtype=weight_dtype, ignore_list=ignore_list)
 
         if self.args.gradient_checkpointing:
-            self.components.high_noise_model.enable_gradient_checkpointing()
-            cprint("✅ Gradient checkpointing enabled for both transformer models.", "green")
+            is_zero3 = (
+                self.accelerator.state.deepspeed_plugin is not None
+                and self.accelerator.state.deepspeed_plugin.zero_stage == 3
+            )
+            if is_zero3:
+                def zero3_checkpoint(module, *inputs):
+                    # DeepSpeed's reentrant checkpoint re-enters module.__call__,
+                    # so ZeRO-3 pre/post-forward hooks gather and repartition the
+                    # parameters during backward recomputation. Ensure at least
+                    # one activation requires gradients, as required by the
+                    # reentrant checkpoint implementation when upstream layers
+                    # are frozen by freeze_non_joint.
+                    inputs = list(inputs)
+                    if not any(torch.is_tensor(value) and value.requires_grad for value in inputs):
+                        inputs[0] = inputs[0].detach().requires_grad_(True)
+                    return deepspeed.checkpointing.checkpoint(module.__call__, *inputs)
+
+                self.components.high_noise_model.enable_gradient_checkpointing(
+                    gradient_checkpointing_func=zero3_checkpoint
+                )
+                cprint("✅ DeepSpeed-compatible reentrant gradient checkpointing enabled.", "green")
+            else:
+                self.components.high_noise_model.enable_gradient_checkpointing()
+                cprint("✅ Gradient checkpointing enabled.", "green")
 
     @override
     def prepare_optimizer(self) -> None:
         logger.info("Initializing optimizer and lr scheduler")
+
+        # ZeRO-3 replaces the local tensor storage with an empty partition before
+        # optimizer construction.  ds_numel/ds_shape retain the logical values
+        # and keep parameter accounting useful in both ZeRO and ordinary runs.
+        def logical_numel(param):
+            return int(getattr(param, "ds_numel", param.numel()))
+
+        def logical_shape(param):
+            return getattr(param, "ds_shape", param.shape)
 
         # Apply freeze_non_joint BEFORE casting so we don't waste fp32 memory on
         # parameters that are about to be frozen.
@@ -591,8 +707,8 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             print("   CHECKING TRAINABLE PARAMETERS")
             for name, param in self.components.high_noise_model.named_parameters():
                 if param.requires_grad:
-                    print(f"   - Trainable: {name}, shape: {param.shape}")
-                    trainable_params_count += param.numel()
+                    print(f"   - Trainable: {name}, shape: {logical_shape(param)}")
+                    trainable_params_count += logical_numel(param)
             print(f"   >>> Total Trainable Parameters: {trainable_params_count / 1_000_000:.2f} M")
             print("="*60 + "\n")
 
@@ -637,7 +753,7 @@ class RynnWorld4DTrainer(WanI2VTrainer):
                     groups.append({"params": joint_out_params, "lr": joint_out_lr})
                 if groups:
                     params_to_optimize = groups
-                trainable_count = sum(p.numel() for g in params_to_optimize for p in g["params"])
+                trainable_count = sum(logical_numel(p) for g in params_to_optimize for p in g["params"])
                 cprint(
                     f"🔒 freeze_non_joint=True: training only joint_*/modality_embed "
                     f"({trainable_count/1e6:.1f}M params, joint_out lr={joint_out_lr:.1e}, "
@@ -650,12 +766,12 @@ class RynnWorld4DTrainer(WanI2VTrainer):
                     {"params": joint_other_params, "lr": self.args.learning_rate * joint_other_lr_multiplier},
                     {"params": joint_out_params, "lr": joint_out_lr},
                 ]
-                out_count = sum(p.numel() for p in joint_out_params)
-                other_joint_count = sum(p.numel() for p in joint_other_params)
+                out_count = sum(logical_numel(p) for p in joint_out_params)
+                other_joint_count = sum(logical_numel(p) for p in joint_other_params)
                 cprint(f"✅ joint_out (zero-init): {out_count/1e6:.1f}M params, lr={joint_out_lr:.1e}", "green")
                 cprint(f"✅ joint_kv/q/norm/align: {other_joint_count/1e6:.1f}M params, lr={self.args.learning_rate * joint_other_lr_multiplier:.1e}", "green")
 
-        self.state.num_trainable_parameters = sum(p.numel() for p in trainable_parameters)
+        self.state.num_trainable_parameters = sum(logical_numel(p) for p in trainable_parameters)
 
         use_deepspeed_opt = (
             self.accelerator.state.deepspeed_plugin is not None
@@ -1164,7 +1280,8 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             logger.info(f"Memory after epoch {epoch + 1}: {json.dumps(memory_statistics, indent=4)}")
 
         accelerator.wait_for_everyone()
-        self._maybe_save_checkpoint(global_step, must_save=True)
+        if getattr(self.args, "save_final_checkpoint", True):
+            self._maybe_save_checkpoint(global_step, must_save=True)
 
         # Final periodic inference — disabled until run_periodic_inference imports are wired up
         if getattr(self.args, 'periodic_inference_steps', 0) > 0:

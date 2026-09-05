@@ -17,6 +17,7 @@ training/
 results/
 outputs/
 wandb/
+data/sample_latents/prompt_embeddings/
 
 # Local planning/session artifacts
 temp/

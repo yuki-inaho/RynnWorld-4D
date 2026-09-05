@@ -40,6 +40,7 @@ class Args(BaseModel):
     train_steps: int | None = None
     checkpointing_steps: int = 200
     checkpointing_limit: int = 10
+    save_final_checkpoint: bool = True
 
     batch_size: int
     gradient_accumulation_steps: int = 1
@@ -268,6 +269,12 @@ class Args(BaseModel):
         # Checkpointing
         parser.add_argument("--checkpointing_steps", type=int, default=200)
         parser.add_argument("--checkpointing_limit", type=int, default=10)
+        parser.add_argument(
+            "--save_final_checkpoint",
+            type=lambda x: str(x).lower() == "true",
+            default=True,
+            help="Save a checkpoint after the final optimizer step. Disable for lightweight smoke tests.",
+        )
         parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
         # Validation
