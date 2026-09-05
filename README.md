@@ -95,10 +95,11 @@ pixi run train-rgbdf-full
 
 The default full profile uses the released stage-3 weights, AMUSE with its
 internal warmup, scalar-only TensorBoard logging, deterministic validation,
-and the best three `val/loss_total` compact checkpoints only. Rigid flow is
-computed at the source's 630×476 resolution, then each modality receives a
-deterministic, modality-aware center pad to the 640×480 Wan canvas and its
-`(48,17,30,40)` latent shape. On the tested 32 GB GPU, AMUSE
+and the best three `val/loss_total` compact checkpoints only. The COLMAP source
+and Wan input are both 640×480; this is encoded without resizing or padding to
+the `(48,17,30,40)` latent shape. The 630×476 resolution used by the related
+HunyuanWorld loader is its requested crop/resize output, not the source-file
+resolution. On the tested 32 GB GPU, AMUSE
 micro-batch 2 completed at 25.622 GiB PyTorch peak allocation and 25.951 GiB
 peak reservation. Micro-batch 3 exhausted the device during backward, so the
 config rejects values above 2; use gradient accumulation for a larger effective

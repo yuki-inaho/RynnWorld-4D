@@ -20,8 +20,8 @@ def validate_training_config(config: DictConfig, *, require_artifacts: bool) -> 
     _require(config.data.format == "rynnworld4d_colmap_rgbdf_latents_v1", "data format is unsupported")
     _require(config.data.source_frames >= 2, "source frame count must be >= 2")
     _require(
-        (int(config.data.source_height), int(config.data.source_width)) == (476, 630),
-        "COLMAP source resolution must be 630x476",
+        (int(config.data.source_height), int(config.data.source_width)) == (480, 640),
+        "COLMAP source resolution must be 640x480",
     )
     _require(
         (int(config.data.height), int(config.data.width)) == (480, 640),

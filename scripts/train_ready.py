@@ -130,10 +130,9 @@ def main() -> None:
                     quality.get("format") == "rynnworld4d_colmap_rgbdf_validation_v1"
                     and quality.get("allow_nan") is False
                     and quality.get("clip_counts") == EXPECTED_CLIPS
-                    and quality.get("source_size") == {"height": 476, "width": 630}
+                    and quality.get("source_size") == {"height": 480, "width": 640}
                     and quality.get("training_canvas") == {"height": 480, "width": 640}
-                    and quality.get("padding")
-                    == "center_rgb_edge_depth_invalid_flow_white_zero_v1"
+                    and quality.get("padding") == "none_v1"
                 )
             except (OSError, json.JSONDecodeError):
                 details["data_quality_report_status"] = "failed"

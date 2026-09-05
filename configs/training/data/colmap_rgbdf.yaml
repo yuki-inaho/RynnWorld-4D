@@ -6,8 +6,8 @@ train_manifest: ${data.latent_root}/train.json
 val_manifest: ${data.latent_root}/val.json
 smoke_manifest: ${data.latent_root}/smoke.json
 source_frames: 65
-source_height: 476
-source_width: 630
+source_height: 480
+source_width: 640
 latent_frames: 17
 height: 480
 width: 640

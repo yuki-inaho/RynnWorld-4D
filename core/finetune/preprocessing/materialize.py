@@ -17,49 +17,6 @@ from core.finetune.preprocessing.rigid_flow import compute_rigid_flow
 EXPECTED_CLIPS = {"train": 93, "val": 8, "smoke": 2}
 
 
-def pad_rgbdf_inputs(
-    rgb: np.ndarray,
-    depth_rgb: np.ndarray,
-    flow_rgb: np.ndarray,
-    depth_valid: np.ndarray,
-    flow_valid: np.ndarray,
-    *,
-    target_height: int = 480,
-    target_width: int = 640,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Center-pad source geometry to the Wan 640x480 sample contract."""
-
-    frames, height, width, channels = rgb.shape
-    expected_channels = (frames, 3, height, width)
-    expected_mask = (frames, height, width)
-    if (
-        rgb.dtype != np.uint8
-        or channels != 3
-        or depth_rgb.shape != expected_channels
-        or flow_rgb.shape != expected_channels
-        or depth_rgb.dtype != np.uint8
-        or flow_rgb.dtype != np.uint8
-        or depth_valid.shape != expected_mask
-        or flow_valid.shape != expected_mask
-        or depth_valid.dtype != np.bool_
-        or flow_valid.dtype != np.bool_
-    ):
-        raise ValueError("RGB-DF arrays cannot be padded because their shapes or dtypes are invalid")
-    if height > target_height or width > target_width:
-        raise ValueError("RGB-DF source dimensions exceed the training canvas")
-    top = (target_height - height) // 2
-    bottom = target_height - height - top
-    left = (target_width - width) // 2
-    right = target_width - width - left
-    spatial = ((top, bottom), (left, right))
-    padded_rgb = np.pad(rgb, ((0, 0), *spatial, (0, 0)), mode="edge")
-    padded_depth = np.pad(depth_rgb, ((0, 0), (0, 0), *spatial), constant_values=0)
-    padded_flow = np.pad(flow_rgb, ((0, 0), (0, 0), *spatial), constant_values=255)
-    padded_depth_valid = np.pad(depth_valid, ((0, 0), *spatial), constant_values=False)
-    padded_flow_valid = np.pad(flow_valid, ((0, 0), *spatial), constant_values=False)
-    return padded_rgb, padded_depth, padded_flow, padded_depth_valid, padded_flow_valid
-
-
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -130,9 +87,7 @@ def materialize_rgbdf(
     flow_percentile: float = 99.0,
     min_valid_flow_ratio: float = 0.05,
     max_photometric_residual: float = 0.75,
-    expected_source_size: tuple[int, int] = (630, 476),
-    target_height: int = 480,
-    target_width: int = 640,
+    expected_source_size: tuple[int, int] = (640, 480),
 ) -> dict:
     source = ColmapRGBDFSource(source_root)
     if source.image_size != expected_source_size:
@@ -155,23 +110,13 @@ def materialize_rgbdf(
             residual = _photometric_residual(raw["rgb"], flow, flow_valid)
             if not math_is_finite(residual) or valid_ratio < min_valid_flow_ratio or residual > max_photometric_residual:
                 raise ValueError(f"RGB-DF quality gate failed for {clip.clip_id}")
-            rgb, depth_rgb, flow_rgb, depth_valid, flow_valid = pad_rgbdf_inputs(
-                raw["rgb"],
-                depth_rgb,
-                flow_rgb,
-                depth_valid,
-                flow_valid,
-                target_height=target_height,
-                target_width=target_width,
-            )
-
             relative = Path("intermediate") / split / f"{clip.clip_id}.npz"
             final_path = output / relative
             final_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = final_path.with_name(f".{final_path.stem}.tmp.npz")
             np.savez_compressed(
                 temporary,
-                rgb=rgb,
+                rgb=raw["rgb"],
                 depth_rgb=depth_rgb,
                 flow_rgb=flow_rgb,
                 depth_valid=depth_valid,
@@ -211,8 +156,8 @@ def materialize_rgbdf(
         "flow_scale": flow_scale,
         "flow_scale_sample_count": scale_samples,
         "source_size": {"height": source.image_size[1], "width": source.image_size[0]},
-        "training_canvas": {"height": target_height, "width": target_width},
-        "padding": "center_rgb_edge_depth_invalid_flow_white_zero_v1",
+        "training_canvas": {"height": source.image_size[1], "width": source.image_size[0]},
+        "padding": "none_v1",
         "clips": reports,
     }
     _atomic_json(output / "reports" / "data_validation.json", report)

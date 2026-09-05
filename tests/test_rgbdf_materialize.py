@@ -3,7 +3,7 @@ import json
 
 import numpy as np
 
-from core.finetune.preprocessing.materialize import materialize_rgbdf, pad_rgbdf_inputs
+from core.finetune.preprocessing.materialize import materialize_rgbdf
 from tests.test_colmap_rgbdf_source import make_source
 
 
@@ -23,8 +23,6 @@ def test_cpu_materializer_is_deterministic_and_private_path_free(tmp_path):
         expected_clips=expected,
         min_valid_flow_ratio=0.01,
         expected_source_size=(8, 6),
-        target_height=6,
-        target_width=8,
     )
     artifact = next((output / "intermediate" / "train").glob("*.npz"))
     first_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -34,11 +32,12 @@ def test_cpu_materializer_is_deterministic_and_private_path_free(tmp_path):
         expected_clips=expected,
         min_valid_flow_ratio=0.01,
         expected_source_size=(8, 6),
-        target_height=6,
-        target_width=8,
     )
 
     assert first["clip_counts"] == expected
+    assert first["source_size"] == {"height": 6, "width": 8}
+    assert first["training_canvas"] == first["source_size"]
+    assert first["padding"] == "none_v1"
     assert second["flow_scale"] == first["flow_scale"]
     assert hashlib.sha256(artifact.read_bytes()).hexdigest() == first_hash
     with np.load(artifact) as arrays:
@@ -49,29 +48,3 @@ def test_cpu_materializer_is_deterministic_and_private_path_free(tmp_path):
     rendered = json.dumps(first)
     assert str(tmp_path) not in rendered
     assert "private-source" not in rendered
-
-
-def test_rgbdf_padding_preserves_source_and_uses_modality_specific_borders():
-    rgb = np.full((1, 2, 3, 3), 7, dtype=np.uint8)
-    depth = np.full((1, 3, 2, 3), 11, dtype=np.uint8)
-    flow = np.full((1, 3, 2, 3), 13, dtype=np.uint8)
-    valid = np.ones((1, 2, 3), dtype=bool)
-
-    rgb_out, depth_out, flow_out, depth_valid, flow_valid = pad_rgbdf_inputs(
-        rgb,
-        depth,
-        flow,
-        valid,
-        valid,
-        target_height=4,
-        target_width=5,
-    )
-
-    assert rgb_out.shape == (1, 4, 5, 3)
-    assert np.all(rgb_out == 7)
-    assert np.all(depth_out[:, :, 1:3, 1:4] == 11)
-    assert np.all(flow_out[:, :, 1:3, 1:4] == 13)
-    assert np.all(depth_out[:, :, 0] == 0)
-    assert np.all(flow_out[:, :, 0] == 255)
-    assert not depth_valid[:, 0].any()
-    assert not flow_valid[:, 0].any()
