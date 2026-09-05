@@ -1,0 +1,66 @@
+[workspace]
+channels = ["conda-forge"]
+name = "RynnWorld-4D"
+platforms = [{ platform = "linux-64", cuda = "12.8" }]
+version = "0.1.0"
+
+[tasks]
+# Download pretrained models into ./pretrained/ (Wan backbone + released
+# RynnWorld-4D weights + DA3 for the policy head). Safe to re-run.
+download-models = """
+bash -c '\
+  mkdir -p pretrained && \
+  export HF_HUB_ENABLE_HF_TRANSFER=1 && \
+  hf download Wan-AI/Wan2.2-TI2V-5B-Diffusers --local-dir ./pretrained/Wan2.2-TI2V-5B-Diffusers && \
+  hf download Alibaba-DAMO-Academy/RynnWorld-4D --local-dir ./pretrained/RynnWorld-4D && \
+  hf download depth-anything/DA3-LARGE --local-dir ./pretrained/da3 && \
+  echo "=== all pretrained models ready ===" '
+"""
+# CPU-safe environment check. Reading package metadata does not import PyTorch
+# or initialize CUDA.
+verify = "python -c \"from importlib.metadata import version; names = ('torch', 'accelerate', 'deepspeed', 'diffusers', 'transformers'); print('\\n'.join(f'{name}={version(name)}' for name in names))\""
+# Run only when the GPU is available for this process.
+verify-gpu = "python -c \"import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print(f'cuda={torch.version.cuda}'); print(f'gpu={torch.cuda.get_device_name(0)}')\""
+# World-model inference with the released stage-3 checkpoint.
+inference = """
+python inference-sft.py \
+  --model_path ./pretrained/Wan2.2-TI2V-5B-Diffusers \
+  --checkpoint_path ./pretrained/RynnWorld-4D \
+  --json_path ./data/sample.json \
+  --output_dir ./results/inference-sft \
+  --num_inference_steps 50 \
+  --guidance_scale 1.0
+"""
+# Optional: install the extra deps for RynnWorld-4D-Policy on top of this env
+# (flash-attn compiles against the installed torch; takes a long time).
+policy-env = "bash rynnworld4d_policy/policy_env.sh"
+
+[dependencies]
+python = "3.10.*"
+pip = ">=25"
+
+[pypi-dependencies]
+# The upstream README uses torch cu121. This Blackwell profile instead selects
+# the CUDA 12.8-compatible PyTorch release.
+torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.1", index = "https://download.pytorch.org/whl/cu128" }
+# requirements.txt
+diffusers = "==0.35.2"
+transformers = "==4.57.1"
+accelerate = "==1.12.0"
+sentencepiece = "==0.2.1"
+peft = "==0.18.0"
+ftfy = "==6.3.1"
+numpy = "==1.26.4"
+wandb = "==0.23.0"
+decord = "==0.6.0"
+deepspeed = "==0.18.2"
+opencv-python-headless = "*"
+imageio = "*"
+imageio-ffmpeg = "*"
+tyro = "*"
+termcolor = "*"
+# model download helper (hf CLI) + fast transfer
+huggingface-hub = { version = ">=0.36", extras = ["hf_transfer"] }
+# editable install of the rynnworld4d package (setup.py)
+rynnworld4d = { path = ".", editable = true }

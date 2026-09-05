@@ -1,0 +1,22 @@
+# Pixi and Python build caches
+.pixi/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local credentials and machine-specific environment files
+.env
+.env.*
+!.env.example
+
+# Downloaded models and generated training artifacts
+pretrained/
+training/
+results/
+outputs/
+wandb/
+
+# Local planning/session artifacts
+temp/

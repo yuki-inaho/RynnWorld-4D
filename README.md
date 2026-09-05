@@ -38,6 +38,38 @@ We present **RynnWorld-4D**, a novel 4D embodied world model that shifts the par
 
 ### 🔧 Environment Setup
 
+#### Pixi (recommended for CUDA 12.8 / Blackwell)
+
+This fork includes a locked [Pixi](https://pixi.sh/) environment for Python 3.10
+and CUDA 12.8-compatible PyTorch packages:
+
+```bash
+# Install Pixi once if it is not already available.
+curl -fsSL https://pixi.sh/install.sh | sh
+
+# Reopen the shell if needed, then create the locked project environment.
+pixi install --locked
+pixi run verify
+```
+
+The verification task is CPU-safe and does not initialize CUDA. When a GPU is
+available to the process, verify the CUDA runtime separately:
+
+```bash
+pixi run verify-gpu
+```
+
+Run repository commands through Pixi, for example:
+
+```bash
+pixi run inference
+```
+
+Downloaded model weights remain outside version control under `pretrained/`.
+They can be fetched with `pixi run download-models` when needed.
+
+#### Conda / pip
+
 We use anaconda or miniconda to manage the python environment:
 ```bash
 conda create -n "rynnworld4d" python=3.10 -y
