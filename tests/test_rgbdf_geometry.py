@@ -46,6 +46,18 @@ def test_rigid_flow_known_camera_translation() -> None:
     assert np.max(np.abs(flow[1, valid[1], 1])) < 1e-4
 
 
+def test_rigid_flow_zero_depth_does_not_evaluate_invalid_division() -> None:
+    depth = np.zeros((2, 3, 4), dtype=np.float32)
+    intrinsics = np.repeat(np.eye(3, dtype=np.float32)[None], 2, axis=0)
+    extrinsics = np.repeat(np.eye(4, dtype=np.float32)[None, :3], 2, axis=0)
+
+    with np.errstate(divide="raise", invalid="raise"):
+        flow, valid = compute_rigid_flow(depth, intrinsics, extrinsics)
+
+    assert np.isfinite(flow).all()
+    assert not valid.any()
+
+
 def test_flow_scale_and_white_zero_encoding() -> None:
     flow = np.array([[[[0.0, 0.0], [1.0, 0.0], [0.0, 2.0]]]], dtype=np.float32)
     valid = np.array([[[False, True, True]]])

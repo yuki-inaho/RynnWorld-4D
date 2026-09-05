@@ -67,7 +67,14 @@ def compute_rigid_flow(
             nearest_y = np.rint(target_y).astype(np.int64).clip(0, height - 1)
             observed = depth_m[target_index, nearest_y, nearest_x]
             target_valid &= observed > 0
-            relative_error = np.abs(observed - target_z) / np.maximum(observed, target_z)
+            denominator = np.maximum(observed, target_z)
+            relative_error = np.full_like(denominator, np.inf)
+            np.divide(
+                np.abs(observed - target_z),
+                denominator,
+                out=relative_error,
+                where=denominator > 0,
+            )
             target_valid &= relative_error <= relative_depth_tolerance
 
         flat_flow = flow[target_index].reshape(-1, 2)
