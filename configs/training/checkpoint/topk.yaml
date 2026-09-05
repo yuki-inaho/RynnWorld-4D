@@ -1,0 +1,4 @@
+k: 3
+monitor: val/loss_total
+mode: min
+save_last: false

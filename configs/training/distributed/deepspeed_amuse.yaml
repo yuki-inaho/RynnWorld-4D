@@ -1,0 +1,5 @@
+name: deepspeed_amuse
+config_path: configs_zero/zero3_offload_amuse.yaml
+num_processes: 1
+zero_stage: 3
+custom_optimizer: true

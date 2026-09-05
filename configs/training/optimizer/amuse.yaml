@@ -1,0 +1,17 @@
+name: amuse
+muon_lr: 1.0e-5
+aux_lr: 1.0e-6
+joint_out_multiplier: 1.0
+joint_other_multiplier: 1.0
+beta1: 0.4
+beta2: 0.999
+epsilon: 1.0e-10
+momentum: 0.95
+rho: 0.3
+r: 0.0
+weight_lr_power: 2.0
+warmup_ratio: 0.05
+min_warmup_steps: 2
+weight_decay: 0.01
+weight_decay_at_y: 0.0
+scheduler: null

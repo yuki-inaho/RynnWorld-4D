@@ -1,0 +1,8 @@
+name: adamw
+learning_rate: 1.0e-6
+beta1: 0.9
+beta2: 0.95
+epsilon: 1.0e-8
+weight_decay: 1.0e-4
+scheduler: cosine_with_warmup
+warmup_steps: 0

@@ -61,10 +61,9 @@ def get_optimizer(
     # Optimizer creation
     supported_optimizers = ["adam", "adamw", "prodigy", "came"]
     if optimizer_name not in supported_optimizers:
-        logger.warning(
-            f"Unsupported choice of optimizer: {optimizer_name}. Supported optimizers include {supported_optimizers}. Defaulting to `AdamW`."
+        raise ValueError(
+            f"Unsupported choice of optimizer: {optimizer_name}. Supported optimizers: {supported_optimizers}."
         )
-        optimizer_name = "adamw"
 
     if (use_8bit or use_4bit) and optimizer_name not in ["adam", "adamw"]:
         raise ValueError("`use_8bit` and `use_4bit` can only be used with the Adam and AdamW optimizers.")

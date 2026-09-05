@@ -6,6 +6,7 @@ from core.finetune.models.utils import get_model_cls
 import argparse
 import datetime
 import logging
+import os
 from pathlib import Path
 from typing import Any, List, Literal, Tuple
 
@@ -23,7 +24,7 @@ class Args(BaseModel):
 
     ########## Output ##########
     output_dir: Path = Path("train_results/{:%Y-%m-%d-%H-%M-%S}".format(datetime.datetime.now()))
-    report_to: Literal["tensorboard", "wandb", "all"] | None = None
+    report_to: Literal["tensorboard", "wandb", "all", "none"] | None = None
     tracker_name: str = "finetrainer-cogvideo"
 
     ########## Data ###########
@@ -31,6 +32,9 @@ class Args(BaseModel):
     # caption_column: Path
     # image_column: Path | None = None
     # video_column: Path
+    dataset_format: Literal["legacy", "colmap_rgbdf"] = "legacy"
+    train_manifest: Path | None = None
+    val_manifest: Path | None = None
 
     ########## Training #########
     resume_from_checkpoint: Path | None = None
@@ -126,6 +130,26 @@ class Args(BaseModel):
     num_inference_samples: int = 3
     inference_num_frames: int = 25
     inference_output_dir: str = "./validation_output"
+
+    ########## Managed training ##########
+    managed_training: bool = False
+    managed_tensorboard: bool = True
+    metric_validation: bool = False
+    validation_every_epochs: int = 1
+    topk: int = 3
+    checkpoint_monitor: str = "val/loss_total"
+    checkpoint_mode: Literal["min", "max"] = "min"
+    save_last: bool = False
+    amuse_muon_lr: float = 1e-5
+    amuse_aux_lr: float = 1e-6
+    amuse_beta1: float = 0.4
+    amuse_momentum: float = 0.95
+    amuse_rho: float = 0.3
+    amuse_r: float = 0.0
+    amuse_weight_lr_power: float = 2.0
+    amuse_warmup_ratio: float = 0.05
+    amuse_min_warmup_steps: int = 2
+    amuse_weight_decay_at_y: float = 0.0
 
     #### deprecated args: gen_video_resolution
     # 1. If set do_validation, should not be None
@@ -253,6 +277,9 @@ class Args(BaseModel):
         parser.add_argument("--num_workers", type=int, default=8)
         parser.add_argument("--pin_memory", type=bool, default=True)
         parser.add_argument("--image_column", type=str, default=None)
+        parser.add_argument("--dataset_format", choices=["legacy", "colmap_rgbdf"], default="legacy")
+        parser.add_argument("--train_manifest", type=str, default=os.environ.get("RYNNWORLD4D_TRAIN_MANIFEST"))
+        parser.add_argument("--val_manifest", type=str, default=os.environ.get("RYNNWORLD4D_VAL_MANIFEST"))
 
         # Model configuration
         parser.add_argument("--mixed_precision", type=str, default="no")
@@ -292,6 +319,24 @@ class Args(BaseModel):
         parser.add_argument("--num_inference_samples", type=int, default=3)
         parser.add_argument("--inference_num_frames", type=int, default=25)
         parser.add_argument("--inference_output_dir", type=str, default="./validation_output")
+        parser.add_argument("--managed_training", type=lambda x: str(x).lower() == "true", default=False)
+        parser.add_argument("--managed_tensorboard", type=lambda x: str(x).lower() == "true", default=True)
+        parser.add_argument("--metric_validation", type=lambda x: str(x).lower() == "true", default=False)
+        parser.add_argument("--validation_every_epochs", type=int, default=1)
+        parser.add_argument("--topk", type=int, default=3)
+        parser.add_argument("--checkpoint_monitor", type=str, default="val/loss_total")
+        parser.add_argument("--checkpoint_mode", choices=["min", "max"], default="min")
+        parser.add_argument("--save_last", type=lambda x: str(x).lower() == "true", default=False)
+        parser.add_argument("--amuse_muon_lr", type=float, default=1e-5)
+        parser.add_argument("--amuse_aux_lr", type=float, default=1e-6)
+        parser.add_argument("--amuse_beta1", type=float, default=0.4)
+        parser.add_argument("--amuse_momentum", type=float, default=0.95)
+        parser.add_argument("--amuse_rho", type=float, default=0.3)
+        parser.add_argument("--amuse_r", type=float, default=0.0)
+        parser.add_argument("--amuse_weight_lr_power", type=float, default=2.0)
+        parser.add_argument("--amuse_warmup_ratio", type=float, default=0.05)
+        parser.add_argument("--amuse_min_warmup_steps", type=int, default=2)
+        parser.add_argument("--amuse_weight_decay_at_y", type=float, default=0.0)
 
 
         parser.add_argument("--is_concat", type=lambda x: (str(x).lower() == 'true'), default=True)

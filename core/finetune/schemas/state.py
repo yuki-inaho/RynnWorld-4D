@@ -27,8 +27,9 @@ class State(BaseModel):
     validation_videos: List[Path | None] = []
 
     using_deepspeed: bool = False
+    amuse_group_fingerprint: str | None = None
+    amuse_warmup_steps: int | None = None
 
     moe_boundary: Optional[int] = None
-
 
 

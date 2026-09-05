@@ -1,0 +1,20 @@
+defaults:
+  - data: colmap_rgbdf
+  - model: released_stage3
+  - optimizer: amuse
+  - trainer: blackwell_32gb
+  - checkpoint: topk
+  - logging: tensorboard
+  - distributed: deepspeed_amuse
+  - _self_
+
+mode: train
+seed: 42
+resume_from_checkpoint: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/training/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  output_subdir: null

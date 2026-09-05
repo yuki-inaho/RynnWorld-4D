@@ -6,7 +6,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
-smoke_output_dir="${RYNNWORLD_SMOKE_OUTPUT_DIR:-outputs/pretrained-stage3-smoke-1step}"
+smoke_output_dir="${RYNNWORLD_SMOKE_OUTPUT_DIR:-outputs/pretrained-stage3-amuse-smoke-1step}"
 smoke_batch_size="${RYNNWORLD_SMOKE_BATCH_SIZE:-1}"
 smoke_manifest="${RYNNWORLD_SMOKE_MANIFEST:-data/sample.json}"
 
@@ -17,7 +17,7 @@ exec accelerate launch \
   --gpu_ids 0 \
   --mixed_precision bf16 \
   --dynamo_backend no \
-  --deepspeed_config_file configs_zero/zero3_offload_smoke.yaml \
+  --deepspeed_config_file configs_zero/zero3_offload_amuse.yaml \
   --zero3_init_flag true \
   --zero3_save_16bit_model false \
   finetune_rynnworld4d.py \
@@ -37,8 +37,11 @@ exec accelerate launch \
   --num_workers 0 \
   --gradient_checkpointing true \
   --learning_rate 1e-6 \
-  --optimizer adamw \
-  --lr_scheduler cosine_with_warmup \
+  --optimizer amuse \
+  --beta2 0.999 \
+  --epsilon 1e-10 \
+  --weight_decay 0.01 \
+  --lr_scheduler constant \
   --lr_warmup_steps 0 \
   --checkpointing_steps 999999 \
   --checkpointing_limit 1 \
@@ -65,4 +68,14 @@ exec accelerate launch \
   --freeze_non_joint true \
   --branch_dropout_prob 0.0 \
   --periodic_inference_steps 0 \
-  --load_stage2_model_weights pretrained/RynnWorld-4D
+  --load_stage2_model_weights pretrained/RynnWorld-4D \
+  --amuse_muon_lr 1e-5 \
+  --amuse_aux_lr 1e-6 \
+  --amuse_beta1 0.4 \
+  --amuse_momentum 0.95 \
+  --amuse_rho 0.3 \
+  --amuse_r 0.0 \
+  --amuse_weight_lr_power 2.0 \
+  --amuse_warmup_ratio 0.05 \
+  --amuse_min_warmup_steps 2 \
+  --amuse_weight_decay_at_y 0.0

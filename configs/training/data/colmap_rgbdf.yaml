@@ -1,0 +1,20 @@
+name: colmap_rgbdf
+format: rynnworld4d_colmap_rgbdf_latents_v1
+source_root: ${oc.env:RYNNWORLD4D_COLMAP_ROOT}
+latent_root: ${oc.env:RYNNWORLD4D_LATENT_ROOT}
+train_manifest: ${data.latent_root}/train.json
+val_manifest: ${data.latent_root}/val.json
+smoke_manifest: ${data.latent_root}/smoke.json
+source_frames: 65
+source_height: 476
+source_width: 630
+latent_frames: 17
+height: 480
+width: 640
+clip_stride: 8
+prompt: ""
+allow_empty_prompt: true
+expected_clips:
+  train: 93
+  val: 8
+  smoke: 2

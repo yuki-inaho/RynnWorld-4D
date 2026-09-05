@@ -13,7 +13,7 @@ __pycache__/
 
 # Downloaded models and generated training artifacts
 pretrained/
-training/
+/training/
 results/
 outputs/
 wandb/

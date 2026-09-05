@@ -3,7 +3,9 @@
 # (video + depth + optical flow) joint training and cosine decay mechanisms.
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
+import copy
 import torch
 from diffusers import (
     AutoencoderKLWan,              
@@ -72,7 +74,22 @@ from accelerate import load_checkpoint_and_dispatch
 import deepspeed
 from einops import rearrange
 import functools
+import hashlib
 import random
+
+from core.finetune.optim import (
+    AmuseInternalScheduler,
+    attach_zero3_amuse,
+    build_amuse_optimizer,
+    find_amuse_optimizer,
+    set_amuse_mode,
+)
+from core.finetune.compact_checkpoint import (
+    load_compact_amuse_checkpoint,
+    save_compact_amuse_checkpoint,
+)
+from core.finetune.tensorboard import ScalarTensorBoardLogger
+from core.finetune.topk_checkpointing import TopKCheckpointManager
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -177,7 +194,20 @@ class RynnWorld4DTrainer(WanI2VTrainer):
                 if os.path.isfile(candidate):
                     full_checkpoint = candidate
 
-            with deepspeed.zero.Init(config_dict_or_path=ds_plugin.deepspeed_config):
+            # Accelerate resolves DeepSpeed's automatic batch fields only in
+            # accelerator.prepare(), which happens after this model is built.
+            # zero.Init needs numeric values immediately, so resolve a private
+            # copy without mutating the plugin config that Accelerate owns.
+            zero_init_config = copy.deepcopy(ds_plugin.deepspeed_config)
+            zero_init_config["train_micro_batch_size_per_gpu"] = self.args.batch_size
+            zero_init_config["gradient_accumulation_steps"] = self.args.gradient_accumulation_steps
+            zero_init_config["train_batch_size"] = (
+                self.args.batch_size
+                * self.args.gradient_accumulation_steps
+                * self.accelerator.num_processes
+            )
+
+            with deepspeed.zero.Init(config_dict_or_path=zero_init_config):
                 # Diffusers builds VAE/T5 weights through meta tensors when loading.
                 # DeepSpeed zero.Init cannot partition those meta tensors, and neither
                 # component participates in the training forward pass. Keep them out
@@ -215,12 +245,24 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
     @override
     def prepare_for_training(self) -> None:
-        high_noise_model, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
-            self.components.high_noise_model, 
-            self.optimizer, 
-            self.data_loader, 
-            self.lr_scheduler
-        )
+        if self.args.optimizer.lower() == "amuse":
+            high_noise_model, self.optimizer, self.data_loader = self.accelerator.prepare(
+                self.components.high_noise_model,
+                self.optimizer,
+                self.data_loader,
+            )
+            raw_optimizer = attach_zero3_amuse(self.optimizer)
+            self.lr_scheduler = AmuseInternalScheduler(raw_optimizer)
+        else:
+            high_noise_model, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
+                self.components.high_noise_model,
+                self.optimizer,
+                self.data_loader,
+                self.lr_scheduler,
+            )
+
+        if getattr(self, "validation_loader", None) is not None:
+            self.validation_loader = self.accelerator.prepare_data_loader(self.validation_loader)
 
         self.components.high_noise_model = high_noise_model
 
@@ -248,6 +290,13 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             self._ema_param_names = [n for n, p in unwrapped.named_parameters() if p.requires_grad]
             num_ema_params = sum(p.numel() for p in trainable_params)
             cprint(f"✅ EMA initialized on CPU (decay={self.args.ema_decay}, tracking {len(trainable_params)} params, {num_ema_params/1e6:.1f}M parameters).", "green")
+
+    @override
+    def prepare_trackers(self) -> None:
+        if getattr(self.args, "managed_training", False):
+            logger.info("Using managed scalar-only TensorBoard logging")
+            return
+        super().prepare_trackers()
 
     @override
     def __prepare_saving_loading_hooks(self, transformer_lora_config):
@@ -703,12 +752,16 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
         if self.accelerator.is_main_process:
             trainable_params_count = 0
+            trainable_tensor_count = 0
             print("\n" + "="*60)
             print("   CHECKING TRAINABLE PARAMETERS")
             for name, param in self.components.high_noise_model.named_parameters():
                 if param.requires_grad:
-                    print(f"   - Trainable: {name}, shape: {logical_shape(param)}")
+                    if not getattr(self.args, "managed_training", False):
+                        print(f"   - Trainable: {name}, shape: {logical_shape(param)}")
                     trainable_params_count += logical_numel(param)
+                    trainable_tensor_count += 1
+            print(f"   >>> Trainable Parameter Tensors: {trainable_tensor_count}")
             print(f"   >>> Total Trainable Parameters: {trainable_params_count / 1_000_000:.2f} M")
             print("="*60 + "\n")
 
@@ -773,6 +826,47 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
         self.state.num_trainable_parameters = sum(logical_numel(p) for p in trainable_parameters)
 
+        num_update_steps_per_epoch = math.ceil(len(self.data_loader) / self.args.gradient_accumulation_steps)
+        if self.args.train_steps is None:
+            self.args.train_steps = self.args.train_epochs * num_update_steps_per_epoch
+            self.state.overwrote_max_train_steps = True
+
+        if self.args.optimizer.lower() == "amuse":
+            plugin = self.accelerator.state.deepspeed_plugin
+            if plugin is not None:
+                deepspeed_config = plugin.deepspeed_config
+                if "optimizer" in deepspeed_config or "scheduler" in deepspeed_config:
+                    raise ValueError("AMUSE requires a DeepSpeed profile without optimizer or scheduler")
+            result = build_amuse_optimizer(
+                self.components.high_noise_model,
+                total_optimizer_steps=self.args.train_steps,
+                muon_lr=self.args.amuse_muon_lr,
+                aux_lr=self.args.amuse_aux_lr,
+                joint_out_multiplier=(self.args.joint_out_lr / self.args.amuse_aux_lr),
+                joint_other_multiplier=self.args.joint_other_lr_multiplier,
+                beta1=self.args.amuse_beta1,
+                beta2=self.args.beta2,
+                eps=self.args.epsilon,
+                momentum=self.args.amuse_momentum,
+                rho=self.args.amuse_rho,
+                r=self.args.amuse_r,
+                weight_lr_power=self.args.amuse_weight_lr_power,
+                warmup_ratio=self.args.amuse_warmup_ratio,
+                min_warmup_steps=self.args.amuse_min_warmup_steps,
+                weight_decay=self.args.weight_decay,
+                weight_decay_at_y=self.args.amuse_weight_decay_at_y,
+            )
+            self.state.amuse_group_fingerprint = result.grouping.fingerprint
+            self.state.amuse_warmup_steps = result.warmup_steps
+            self.optimizer = result.optimizer
+            self.lr_scheduler = AmuseInternalScheduler(result.optimizer)
+            cprint(
+                f"✅ AMUSE initialized: Muon={result.grouping.muon_numel/1e6:.1f}M, "
+                f"aux={result.grouping.fallback_numel/1e6:.1f}M, warmup={result.warmup_steps}",
+                "green",
+            )
+            return
+
         use_deepspeed_opt = (
             self.accelerator.state.deepspeed_plugin is not None
             and "optimizer" in self.accelerator.state.deepspeed_plugin.deepspeed_config
@@ -788,11 +882,6 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             weight_decay=self.args.weight_decay,
             use_deepspeed=use_deepspeed_opt,
         )
-
-        num_update_steps_per_epoch = math.ceil(len(self.data_loader) / self.args.gradient_accumulation_steps)
-        if self.args.train_steps is None:
-            self.args.train_steps = self.args.train_epochs * num_update_steps_per_epoch
-            self.state.overwrote_max_train_steps = True
 
         use_deepspeed_lr_scheduler = (
             self.accelerator.state.deepspeed_plugin is not None
@@ -830,7 +919,7 @@ class RynnWorld4DTrainer(WanI2VTrainer):
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         ret = {"encoded_videos": [], "encoded_depth": [], "encoded_flow": [], "img_latent": [], "depth_latent": [], "flow_latent": [],
-                "null_embedding": [], "text_embedding": []}
+                "null_embedding": [], "text_embedding": [], "sample_ids": []}
         for sample in samples:
             encoded_video = sample["encoded_video"]
             encoded_depth = sample["encoded_depth"]
@@ -850,6 +939,8 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             ret["flow_latent"].append(flow_latent)
             ret["null_embedding"].append(null_embedding)
             ret["text_embedding"].append(text_embedding)
+            if "sample_id" in sample:
+                ret["sample_ids"].append(sample["sample_id"])
 
         ret["encoded_videos"] = torch.stack(ret["encoded_videos"])
         ret["encoded_depth"] = torch.stack(ret["encoded_depth"])
@@ -863,6 +954,59 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
     @override
     def prepare_dataset(self) -> None:
+        if getattr(self.args, "dataset_format", "legacy") == "colmap_rgbdf":
+            if not self.args.managed_training:
+                raise ValueError("COLMAP RGB-DF requires managed_training=true")
+            if self.args.optimizer.lower() != "amuse":
+                raise ValueError("managed COLMAP RGB-DF checkpoints currently require AMUSE")
+            if self.args.train_manifest is None or self.args.val_manifest is None:
+                raise ValueError("COLMAP RGB-DF requires train_manifest and val_manifest")
+            from core.finetune.datasets.colmap_rgbdf_latents import ColmapRGBDFLatentDataset
+
+            self.dataset = ColmapRGBDFLatentDataset(
+                self.args.train_manifest,
+                expected_split="train",
+            )
+            self.validation_dataset = ColmapRGBDFLatentDataset(
+                self.args.val_manifest,
+                expected_split="val",
+            )
+            unload_model(self.components.vae)
+            unload_model(self.components.text_encoder)
+            free_memory()
+            self.data_loader = torch.utils.data.DataLoader(
+                self.dataset,
+                collate_fn=self.collate_fn,
+                batch_size=self.args.batch_size,
+                num_workers=self.args.num_workers,
+                pin_memory=self.args.pin_memory,
+                shuffle=True,
+            )
+            self.validation_loader = torch.utils.data.DataLoader(
+                self.validation_dataset,
+                collate_fn=self.collate_fn,
+                batch_size=1,
+                num_workers=self.args.num_workers,
+                pin_memory=self.args.pin_memory,
+                shuffle=False,
+            )
+            self.managed_logger = ScalarTensorBoardLogger(
+                Path(self.args.output_dir) / "tensorboard",
+                is_main_process=(
+                    self.accelerator.is_main_process
+                    and getattr(self.args, "managed_tensorboard", True)
+                ),
+            )
+            if self.accelerator.num_processes != 1:
+                raise ValueError("managed AMUSE top-K training currently requires one process")
+            self.topk_manager = TopKCheckpointManager(
+                Path(self.args.output_dir) / "checkpoints",
+                k=self.args.topk,
+                monitor=self.args.checkpoint_monitor,
+                mode=self.args.checkpoint_mode,
+            )
+            return
+
         self.components.vae = self.components.vae.to(self.accelerator.device, dtype=self.state.weight_dtype)
         self.components.text_encoder = self.components.text_encoder.to(
             self.accelerator.device, dtype=self.state.weight_dtype
@@ -1030,6 +1174,147 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             "dropout_hit": dropout_hit,
         }
 
+    def _validate_managed(self, global_step: int) -> dict[str, float]:
+        if not getattr(self.args, "metric_validation", False):
+            raise ValueError("managed validation is disabled")
+        raw_optimizer = find_amuse_optimizer(self.optimizer) if self.args.optimizer.lower() == "amuse" else None
+        python_state = random.getstate()
+        cpu_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        self.components.high_noise_model.eval()
+        if raw_optimizer is not None:
+            set_amuse_mode(self.optimizer, training=False)
+        totals = {"total": 0.0, "rgb": 0.0, "depth": 0.0, "flow": 0.0}
+        count = 0
+        try:
+            with torch.no_grad():
+                for batch in self.validation_loader:
+                    sample_ids = batch.get("sample_ids", [])
+                    seed_payload = ":".join(sample_ids).encode()
+                    sample_seed = int.from_bytes(hashlib.sha256(seed_payload).digest()[:8], "little") % (2**31)
+                    random.seed(sample_seed)
+                    torch.manual_seed(sample_seed)
+                    torch.cuda.manual_seed_all(sample_seed)
+                    loss, info = self.compute_loss(batch)
+                    totals["total"] += float(loss)
+                    totals["rgb"] += float(info["loss_video"])
+                    totals["depth"] += float(info["loss_depth"])
+                    totals["flow"] += float(info["loss_flow"])
+                    count += int(batch["encoded_videos"].shape[0])
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+            random.setstate(python_state)
+            if raw_optimizer is not None:
+                set_amuse_mode(self.optimizer, training=True)
+            self.components.high_noise_model.train()
+        if count == 0:
+            raise ValueError("validation loader is empty")
+        metrics = {f"val/loss_{name}": value / count for name, value in totals.items()}
+        if self.accelerator.is_main_process:
+            self.managed_logger.log_many(metrics, global_step)
+            self.managed_logger.flush()
+        return metrics
+
+    def _managed_validation_checkpoint(self, epoch: int, global_step: int) -> None:
+        metrics = self._validate_managed(global_step)
+        if not self.accelerator.is_main_process:
+            return
+        metric = metrics[self.args.checkpoint_monitor]
+        raw_optimizer = find_amuse_optimizer(self.optimizer) if self.args.optimizer.lower() == "amuse" else None
+        if raw_optimizer is not None:
+            set_amuse_mode(self.optimizer, training=False)
+        self.components.high_noise_model.eval()
+        try:
+            self.topk_manager.consider(
+                metric,
+                epoch=epoch,
+                step=global_step,
+                save=lambda path: save_compact_amuse_checkpoint(
+                    path,
+                    model=self.components.high_noise_model,
+                    optimizer=self.optimizer,
+                    epoch=epoch,
+                    global_step=global_step,
+                    metric=metric,
+                    config_fingerprint=self._managed_config_fingerprint(),
+                    grouping_fingerprint=self.state.amuse_group_fingerprint,
+                    pretrained_fingerprint=self._managed_pretrained_fingerprint(),
+                    data_fingerprints={
+                        "train": self.dataset.fingerprint,
+                        "val": self.validation_dataset.fingerprint,
+                    },
+                    generator=self.state.generator,
+                ),
+            )
+        finally:
+            if raw_optimizer is not None:
+                set_amuse_mode(self.optimizer, training=True)
+            self.components.high_noise_model.train()
+
+    def _managed_config_fingerprint(self) -> str:
+        fields = (
+            "amuse_aux_lr",
+            "amuse_beta1",
+            "amuse_min_warmup_steps",
+            "amuse_momentum",
+            "amuse_muon_lr",
+            "amuse_r",
+            "amuse_rho",
+            "amuse_warmup_ratio",
+            "amuse_weight_decay_at_y",
+            "amuse_weight_lr_power",
+            "batch_size",
+            "beta2",
+            "branch_dropout_modes",
+            "branch_dropout_prob",
+            "epsilon",
+            "freeze_non_joint",
+            "fusion_mode",
+            "gradient_accumulation_steps",
+            "joint_end_layer",
+            "joint_every_n_layers",
+            "joint_frame_wise",
+            "joint_other_lr_multiplier",
+            "joint_out_lr",
+            "joint_start_layer",
+            "joint_unidirectional",
+            "joint_use_rope",
+            "joint_video_decay",
+            "joint_video_decay_steps",
+            "loss_weight_flow",
+            "max_grad_norm",
+            "mixed_precision",
+            "model_name",
+            "model_type",
+            "optimizer",
+            "seed",
+            "share_ffn",
+            "train_resolution",
+            "training_type",
+            "weight_decay",
+        )
+        payload = {name: getattr(self.args, name) for name in fields}
+        payload["amuse_warmup_steps"] = self.state.amuse_warmup_steps
+        payload["scheduler_config"] = dict(self.components.scheduler.config)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _managed_pretrained_fingerprint(self) -> str:
+        cached = getattr(self, "_pretrained_fingerprint", None)
+        if cached is not None:
+            return cached
+        root = Path(self.args.load_stage2_model_weights or "")
+        checkpoint = root / "pytorch_model" / "mp_rank_00_model_states.pt"
+        if not checkpoint.is_file():
+            raise RuntimeError("managed checkpointing requires the released pretrained model artifact")
+        digest = hashlib.sha256()
+        with checkpoint.open("rb") as handle:
+            while chunk := handle.read(16 * 1024 * 1024):
+                digest.update(chunk)
+        self._pretrained_fingerprint = digest.hexdigest()
+        return self._pretrained_fingerprint
+
     @override
     def train(self) -> None:
         logger.info("Starting training")
@@ -1054,18 +1339,48 @@ class RynnWorld4DTrainer(WanI2VTrainer):
         first_epoch = 0
         initial_global_step = 0
 
+        accelerator = self.accelerator
+        generator = torch.Generator(device=accelerator.device)
+        if self.args.seed is not None:
+            generator = generator.manual_seed(self.args.seed)
+        self.state.generator = generator
+
         # Potentially load in the weights and states from a previous save
-        (
-            resume_from_checkpoint_path,
-            initial_global_step,
-            global_step,
-            first_epoch,
-        ) = get_latest_ckpt_path_to_resume_from(
-            resume_from_checkpoint=self.args.resume_from_checkpoint,
-            num_update_steps_per_epoch=self.state.num_update_steps_per_epoch,
-            output_dir=self.args.output_dir,
-        )
-        if resume_from_checkpoint_path is not None:
+        if getattr(self.args, "managed_training", False):
+            resume_from_checkpoint_path = self.args.resume_from_checkpoint
+            if resume_from_checkpoint_path is not None:
+                if str(resume_from_checkpoint_path) == "latest" or not Path(resume_from_checkpoint_path).is_dir():
+                    raise ValueError("managed training requires an existing explicit compact checkpoint directory")
+                resume = load_compact_amuse_checkpoint(
+                    resume_from_checkpoint_path,
+                    model=self.components.high_noise_model,
+                    optimizer=self.optimizer,
+                    config_fingerprint=self._managed_config_fingerprint(),
+                    grouping_fingerprint=self.state.amuse_group_fingerprint,
+                    pretrained_fingerprint=self._managed_pretrained_fingerprint(),
+                    data_fingerprints={
+                        "train": self.dataset.fingerprint,
+                        "val": self.validation_dataset.fingerprint,
+                    },
+                    generator=self.state.generator,
+                )
+                initial_global_step = resume.global_step
+                global_step = resume.global_step
+                first_epoch = resume.first_epoch
+                if global_step >= self.args.train_steps or first_epoch >= self.args.train_epochs:
+                    raise ValueError("compact checkpoint has no remaining configured training steps")
+        else:
+            (
+                resume_from_checkpoint_path,
+                initial_global_step,
+                global_step,
+                first_epoch,
+            ) = get_latest_ckpt_path_to_resume_from(
+                resume_from_checkpoint=self.args.resume_from_checkpoint,
+                num_update_steps_per_epoch=self.state.num_update_steps_per_epoch,
+                output_dir=self.args.output_dir,
+            )
+        if resume_from_checkpoint_path is not None and not getattr(self.args, "managed_training", False):
             self.accelerator.load_state(resume_from_checkpoint_path)
             # Resume EMA weights if available
             if self.ema_model is not None:
@@ -1115,11 +1430,8 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             print(f"{'Global Step':<15} | {'Samples This Step':<20} | {'Instant Throughput':<25} | {'Average Throughput':<25}")
             print("="*80)
 
-        accelerator = self.accelerator
-        generator = torch.Generator(device=accelerator.device)
-        if self.args.seed is not None:
-            generator = generator.manual_seed(self.args.seed)
-        self.state.generator = generator
+        if self.args.optimizer.lower() == "amuse":
+            set_amuse_mode(self.optimizer, training=True)
 
         free_memory()
         for epoch in range(first_epoch, self.args.train_epochs):
@@ -1230,6 +1542,24 @@ class RynnWorld4DTrainer(WanI2VTrainer):
                 if not loss_info["dropout_hit"]:
                     logs["loss_clean"] = logs["loss"]
 
+                if getattr(self.args, "managed_training", False) and accelerator.sync_gradients:
+                    learning_rates = self.lr_scheduler.get_last_lr()
+                    managed_logs = {
+                        "train/loss_total": logs["loss"],
+                        "train/loss_rgb": logs["loss_video"],
+                        "train/loss_depth": logs["loss_depth"],
+                        "train/loss_flow": logs["loss_flow"],
+                        "train/grad_norm": logs["grad_norm"],
+                        "optimizer/lr": learning_rates[0],
+                        "system/gpu_peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                        "system/gpu_peak_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
+                        "system/samples_per_second": instant_throughput,
+                    }
+                    if self.args.optimizer.lower() == "amuse":
+                        managed_logs["optimizer/lr_muon"] = learning_rates[0]
+                        managed_logs["optimizer/lr_aux"] = learning_rates[-1]
+                    self.managed_logger.log_many(managed_logs, global_step)
+
                 # joint_gate means every 50 optimizer steps — confirms cross-modal pathways
                 # are active (gate=0 means the joint branch has been shut off by the model).
                 if accelerator.sync_gradients and global_step % 50 == 0:
@@ -1276,11 +1606,17 @@ class RynnWorld4DTrainer(WanI2VTrainer):
                 if global_step >= self.args.train_steps:
                     break
 
+            if (
+                getattr(self.args, "managed_training", False)
+                and (epoch + 1) % self.args.validation_every_epochs == 0
+            ):
+                self._managed_validation_checkpoint(epoch, global_step)
+
             memory_statistics = get_memory_statistics()
             logger.info(f"Memory after epoch {epoch + 1}: {json.dumps(memory_statistics, indent=4)}")
 
         accelerator.wait_for_everyone()
-        if getattr(self.args, "save_final_checkpoint", True):
+        if getattr(self.args, "save_final_checkpoint", True) and not getattr(self.args, "managed_training", False):
             self._maybe_save_checkpoint(global_step, must_save=True)
 
         # Final periodic inference — disabled until run_periodic_inference imports are wired up
@@ -1293,6 +1629,10 @@ class RynnWorld4DTrainer(WanI2VTrainer):
             free_memory()
             self.validate(global_step)
 
+        if getattr(self.args, "managed_training", False):
+            self.managed_logger.flush()
+            self.managed_logger.close()
+
         del self.components
         free_memory()
         memory_statistics = get_memory_statistics()
@@ -1302,6 +1642,8 @@ class RynnWorld4DTrainer(WanI2VTrainer):
 
     @override
     def _maybe_save_checkpoint(self, global_step: int, must_save: bool = False):
+        if getattr(self.args, "managed_training", False):
+            return
         if not (must_save or global_step % self.args.checkpointing_steps == 0):
             return
         save_path = get_intermediate_ckpt_path(

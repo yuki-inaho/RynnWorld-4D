@@ -1,0 +1,17 @@
+name: rynnworld4d
+base_path: pretrained/Wan2.2-TI2V-5B-Diffusers
+stage3_path: pretrained/RynnWorld-4D
+training_type: sft
+fusion_mode: joint
+share_ffn: false
+freeze_non_joint: true
+joint_start_layer: 0
+joint_end_layer: 30
+joint_every_n_layers: 3
+joint_frame_wise: true
+joint_use_rope: true
+joint_unidirectional: false
+joint_video_decay: true
+joint_video_decay_steps: 141
+branch_dropout_prob: 0.0
+loss_weight_flow: 1.0

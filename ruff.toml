@@ -1,0 +1,2 @@
+[lint.per-file-ignores]
+"core/finetune/optim/amuse.py" = ["TRY002"]

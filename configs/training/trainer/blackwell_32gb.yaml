@@ -1,0 +1,12 @@
+epochs: 3
+max_steps: null
+micro_batch_size: 2
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+gradient_checkpointing: true
+max_grad_norm: 1.0
+num_workers: 2
+pin_memory: true
+validation_every_epochs: 1
+save_final_checkpoint: false
+periodic_inference_steps: 0

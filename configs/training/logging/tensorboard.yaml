@@ -1,0 +1,3 @@
+name: tensorboard
+directory: tensorboard
+flush_secs: 10

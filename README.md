@@ -78,7 +78,33 @@ pixi run train-pretrained-smoke
 The smoke task trains only the joint-attention parameters, writes TensorBoard
 events under `outputs/pretrained-stage3-smoke-1step/`, and intentionally skips
 the large final checkpoint. Override the output directory with
-`RYNNWORLD_SMOKE_OUTPUT_DIR` if needed.
+`RYNNWORLD_SMOKE_OUTPUT_DIR`, or the micro-batch size with
+`RYNNWORLD_SMOKE_BATCH_SIZE`, if needed.
+
+For the Hydra-managed COLMAP RGB-DF workflow, set
+`RYNNWORLD4D_COLMAP_ROOT` and `RYNNWORLD4D_LATENT_ROOT`, then run:
+
+```bash
+pixi run audit-rgbdf-cpu
+pixi run prepare-rgbdf-cpu
+pixi run encode-rgbdf-latents
+pixi run train-ready
+pixi run train-rgbdf-smoke
+pixi run train-rgbdf-full
+```
+
+The default full profile uses the released stage-3 weights, AMUSE with its
+internal warmup, scalar-only TensorBoard logging, deterministic validation,
+and the best three `val/loss_total` compact checkpoints only. Rigid flow is
+computed at the source's 630×476 resolution, then each modality receives a
+deterministic, modality-aware center pad to the 640×480 Wan canvas and its
+`(48,17,30,40)` latent shape. On the tested 32 GB GPU, AMUSE
+micro-batch 2 completed at 25.622 GiB PyTorch peak allocation and 25.951 GiB
+peak reservation. Micro-batch 3 exhausted the device during backward, so the
+config rejects values above 2; use gradient accumulation for a larger effective
+batch. `train-ready` must report `ready=true` before either managed training
+task is launched; the launcher reruns the same gate and refuses stale or
+incomplete inputs before constructing the model.
 
 #### Conda / pip
 
