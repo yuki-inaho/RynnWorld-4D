@@ -1,7 +1,10 @@
 epochs: 3
 max_steps: null
-micro_batch_size: 2
-gradient_accumulation_steps: 1
+# A real-data two-step probe reached 31.05/31.36 GiB after AMUSE created its
+# persistent optimizer state. Keep the effective batch at two while leaving
+# enough steady-state headroom for validation and checkpoint boundaries.
+micro_batch_size: 1
+gradient_accumulation_steps: 2
 mixed_precision: bf16
 gradient_checkpointing: true
 max_grad_norm: 1.0

@@ -31,7 +31,12 @@ def test_default_config_is_amuse_tensorboard_topk(monkeypatch, tmp_path):
     assert config.checkpoint.k == 3
     assert config.checkpoint.monitor == "val/loss_total"
     assert config.checkpoint.save_last is False
-    assert config.trainer.micro_batch_size == 2
+    assert config.trainer.micro_batch_size == 1
+    assert config.trainer.gradient_accumulation_steps == 2
+    assert (
+        config.trainer.micro_batch_size
+        * config.trainer.gradient_accumulation_steps
+    ) == 2
     assert config.data.source_frames == 65
     assert (config.data.source_width, config.data.source_height) == (640, 480)
     assert (config.data.width, config.data.height) == (640, 480)
